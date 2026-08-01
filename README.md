@@ -1,5 +1,7 @@
 # audiotranscribe
 
+> ⚠️ **Disclaimer: this is an ai generated project**
+
 **Word-level audio transcription for HyperFrames & HeyGen captions.**
 
 `audiotranscribe` converts `.wav` files into timestamped word-level JSON — the
