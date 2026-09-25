@@ -20,9 +20,16 @@ overlays. It comes with a terminal-based karaoke playback mode to verify results
 
 ## Quick start
 
+### Prerequisites
+
+- [conda](https://docs.conda.io/projects/miniconda/) (miniconda or anaconda)
+- `ffmpeg` on PATH
+
 ```sh
-pip install faster-whisper
-# ffmpeg must be on PATH (brew install ffmpeg / apt install ffmpeg)
+conda create -n audiotranscribe python=3.11 -y
+conda activate audiotranscribe
+conda install -c conda-forge ffmpeg -y   # or: brew install ffmpeg / apt install ffmpeg
+pip install -r requirements.txt
 ```
 
 ```sh

@@ -29,7 +29,7 @@ Pass -o to force a single output path (only valid with one input).
 Requires:
     pip install faster-whisper   # for transcribe; not needed for `play`
     # ffmpeg must be on PATH (faster-whisper decodes audio through it)
-    # macOS `afplay` (built in) is used by `play --wav`; optional.
+    # `play --wav` uses ffplay (ships with ffmpeg; enables ←/→ seek), else macOS afplay.
 
 Language note: the multilingual models ("small", "medium", "large-v3") auto-detect
 language. The English-only models ("small.en", etc.) will transcribe non-English
@@ -38,11 +38,14 @@ audio as garbled English — pass --language / a non-.en model for other languag
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
+
+SEEK_STEP = 5.0  # seconds per ←/→ press in the player
 
 
 def transcribe_words(wav_path, model_name, language, device, compute_type):
@@ -135,19 +138,25 @@ def load_words(json_path):
     raise ValueError(f"{json_path}: unrecognized transcript shape")
 
 
-def find_pairs(folder):
-    """Return sorted (wav, transcript_json) tuples in `folder` where both exist.
+def find_tracks(wav):
+    """Every transcript JSON belonging to `wav`: `<name>.json`, `<name>.*.json`
+    (e.g. `01.transcript.json`, `01.en.json`), sorted, sidecar first."""
+    wav = Path(wav)
+    tracks = sorted(wav.parent.glob(f"{wav.stem}.json")) + \
+             sorted(wav.parent.glob(f"{wav.stem}.*.json"))
+    sidecar = wav.with_suffix(".transcript.json")
+    tracks.sort(key=lambda p: (p != sidecar, p.name))
+    return tracks
 
-    A transcript is the wav's `<name>.transcript.json` sidecar, or a plain
-    `<name>.json` fallback."""
+
+def find_pairs(folder):
+    """Return sorted (wav, [transcript_json, ...]) tuples in `folder`.
+
+    A wav is listed once with ALL its transcripts, so several language or
+    revision tracks play together."""
     folder = Path(folder)
-    pairs = []
-    for wav in sorted(folder.glob("*.wav")):
-        for cand in (wav.with_suffix(".transcript.json"), wav.with_suffix(".json")):
-            if cand.exists():
-                pairs.append((wav, cand))
-                break
-    return pairs
+    pairs = [(wav, find_tracks(wav)) for wav in sorted(folder.glob("*.wav"))]
+    return [(wav, tracks) for wav, tracks in pairs if tracks]
 
 
 def pick_pair(pairs):
@@ -166,7 +175,7 @@ def pick_pair(pairs):
             for i, (wav, js) in enumerate(pairs):
                 if i + 2 >= height:
                     break
-                label = f"{wav.name}  →  {js.name}"
+                label = f"{wav.name}  →  " + ", ".join(j.name for j in js)
                 attr = curses.A_REVERSE if i == idx else curses.A_NORMAL
                 stdscr.addnstr(i + 2, 2, label, width - 3, attr)
             stdscr.refresh()
@@ -184,46 +193,75 @@ def pick_pair(pairs):
 
 
 def cmd_play(args, parser):
-    import curses
+    os.environ.setdefault("ESCDELAY", "25")  # curses waits 1s on ESC by default
+    targets = [Path(t) for t in args.input]
+    target = targets[0]
+    speed = args.speed if args.speed and args.speed > 0 else 1.0
 
-    target = Path(args.input)
-    wav_override = args.wav
-
-    if target.is_dir():
+    if len(targets) == 1 and target.is_dir():
         pairs = find_pairs(target)
         if not pairs:
             print(f"{target}: no .wav + transcript pairs found", file=sys.stderr)
             return 1
-        chosen = pick_pair(pairs)
-        if chosen is None:
-            return 0
-        wav_path_sel, target = chosen
-        if wav_override is None:
-            wav_override = wav_path_sel  # auto-pair the wav with the transcript
+        # picker -> play -> back to picker, until q/ESC in the picker
+        while (chosen := pick_pair(pairs)) is not None:
+            wav_path_sel, targets = chosen
+            _play(targets, args.wav or wav_path_sel, speed)
+        return 0
 
-    words = load_words(target)
-    if not words:
-        print(f"{target}: no words to play", file=sys.stderr)
+    if len(targets) == 1 and target.suffix.lower() == ".wav":
+        # a wav: play it with every transcript/translation track it has
+        tracks = find_tracks(target)
+        if not tracks:
+            print(f"{target}: no transcript found (expected {target.stem}.*.json)",
+                  file=sys.stderr)
+            return 1
+        return _play(tracks, args.wav or target, speed)
+
+    if len(targets) == 1 and not args.single:
+        # one file given: pick up its sibling tracks (01.transcript.json + 01.en.json)
+        wav = (args.wav or target.parent / (target.name.split(".")[0] + ".wav"))
+        siblings = find_tracks(wav)
+        if target in siblings:
+            targets = siblings
+    return _play(targets, args.wav, speed)
+
+
+def _play(targets, wav_override, speed):
+    import curses
+
+    tracks = [(t.name, load_words(t)) for t in targets]
+    tracks = [(n, w) for n, w in tracks if w]
+    if not tracks:
+        print(f"{', '.join(map(str, targets))}: no words to play", file=sys.stderr)
         return 1
 
-    total = max(float(w["end"]) for w in words)
-    speed = args.speed if args.speed and args.speed > 0 else 1.0
+    total = max(float(w["end"]) for _, ws in tracks for w in ws)
 
     audio_proc = None
     if wav_override:
         wav_path = Path(wav_override)
         if not wav_path.exists():
             print(f"warning: {wav_path} not found, playing silently", file=sys.stderr)
+        elif shutil.which("ffplay"):
+            # ffplay can start at an offset, so ←/→ seeking keeps audio in sync.
+            audio_proc = lambda pos: subprocess.Popen(
+                ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
+                 "-ss", f"{pos:.2f}", "-af", f"atempo={speed}", str(wav_path)],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
         elif shutil.which("afplay"):
             # afplay -r sets the playback rate; keeps audio in sync with --speed.
-            audio_proc = lambda: subprocess.Popen(
+            # ponytail: afplay can't seek, so audio stops after ←/→; install ffplay for that
+            audio_proc = lambda pos: None if pos else subprocess.Popen(
                 ["afplay", "-r", str(speed), str(wav_path)],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
         else:
-            print("warning: `afplay` not found; playing without audio", file=sys.stderr)
+            print("warning: neither `ffplay` nor `afplay` found; playing without audio",
+                  file=sys.stderr)
 
-    title = target.name
+    title = " + ".join(n for n, _ in tracks)
 
     def run(stdscr):
         curses.curs_set(0)
@@ -235,14 +273,22 @@ def cmd_play(args, parser):
             curses.init_pair(2, curses.COLOR_CYAN, -1)                    # spoken
             curses.init_pair(3, curses.COLOR_WHITE, -1)                   # upcoming
 
-        proc = audio_proc() if audio_proc else None
-        start = time.monotonic()
+        stdscr.keypad(True)
+        base, start = 0.0, time.monotonic()  # transcript time at `start`
+        proc = audio_proc(base) if audio_proc else None
         try:
             while True:
-                elapsed = (time.monotonic() - start) * speed
-                _draw(stdscr, curses, words, elapsed, total, title)
-                if stdscr.getch() in (ord("q"), 27):  # q or ESC
-                    break
+                elapsed = base + (time.monotonic() - start) * speed
+                _draw(stdscr, curses, tracks, elapsed, total, title)
+                key = stdscr.getch()
+                if key in (ord("q"), 27):  # q or ESC: leave right away
+                    return
+                if key in (curses.KEY_LEFT, curses.KEY_RIGHT):
+                    step = SEEK_STEP if key == curses.KEY_RIGHT else -SEEK_STEP
+                    base, start = min(max(elapsed + step, 0.0), total), time.monotonic()
+                    if proc and proc.poll() is None:
+                        proc.terminate()
+                    proc = audio_proc(base) if audio_proc else None
                 if elapsed > total + 0.5:
                     break
                 time.sleep(1 / 60)
@@ -251,14 +297,14 @@ def cmd_play(args, parser):
                 proc.terminate()
         # hold the final frame until a key is pressed
         stdscr.nodelay(False)
-        _draw(stdscr, curses, words, total, total, title, done=True)
+        _draw(stdscr, curses, tracks, total, total, title, done=True)
         stdscr.getch()
 
     curses.wrapper(run)
     return 0
 
 
-def _draw(stdscr, curses, words, elapsed, total, title, done=False):
+def _draw(stdscr, curses, tracks, elapsed, total, title, done=False):
     stdscr.erase()
     height, width = stdscr.getmaxyx()
 
@@ -268,27 +314,32 @@ def _draw(stdscr, curses, words, elapsed, total, title, done=False):
     header = "PLAYING" if not done else "DONE"
     stdscr.addnstr(0, 0, f"{header}  {title}", width - 1, curses.A_BOLD)
     stdscr.addnstr(1, 0, f"[{bar}] {min(elapsed, total):5.2f}/{total:5.2f}s", width - 1)
-    stdscr.addnstr(2, 0, "q/ESC to quit", width - 1, curses.A_DIM)
+    stdscr.addnstr(2, 0, "←/→ seek 5s · q/ESC to go back", width - 1, curses.A_DIM)
 
-    # word-wrapped karaoke text starting on row 4
-    row, col = 4, 0
-    for w in words:
-        text = str(w.get("text", ""))
-        token = text + " "
-        if col + len(token) >= width:
-            row += 1
-            col = 0
+    # one word-wrapped karaoke block per track, starting on row 4
+    row = 4
+    for name, words in tracks:
         if row >= height:
             break
-        start_t, end_t = float(w["start"]), float(w["end"])
-        if start_t <= elapsed <= end_t:
-            attr = curses.color_pair(1) | curses.A_BOLD  # active
-        elif elapsed > end_t:
-            attr = curses.color_pair(2)                  # already spoken
-        else:
-            attr = curses.color_pair(3) | curses.A_DIM   # upcoming
-        stdscr.addnstr(row, col, token, width - col - 1, attr)
-        col += len(token)
+        stdscr.addnstr(row, 0, name, width - 1, curses.A_DIM | curses.A_UNDERLINE)
+        row, col = row + 1, 0
+        for w in words:
+            token = str(w.get("text", "")) + " "
+            if col + len(token) >= width:
+                row += 1
+                col = 0
+            if row >= height:
+                break
+            start_t, end_t = float(w["start"]), float(w["end"])
+            if start_t <= elapsed <= end_t:
+                attr = curses.color_pair(1) | curses.A_BOLD  # active
+            elif elapsed > end_t:
+                attr = curses.color_pair(2)                  # already spoken
+            else:
+                attr = curses.color_pair(3) | curses.A_DIM   # upcoming
+            stdscr.addnstr(row, col, token, width - col - 1, attr)
+            col += len(token)
+        row += 2
 
     stdscr.refresh()
 
@@ -332,9 +383,14 @@ def main(argv=None):
     )
 
     p_p = sub.add_parser("play", help="TUI karaoke playback of a transcript JSON.")
-    p_p.add_argument("input", type=Path,
-                     help="A transcript.json, OR a folder — a folder shows a "
-                          "picker of eligible .wav + transcript pairs.")
+    p_p.add_argument("input", nargs="+", type=Path,
+                     help="One or more transcript.json (played stacked), OR a "
+                          ".wav — plays it with all its tracks (01.*.json), OR a "
+                          "folder — a folder shows a picker of eligible .wav + "
+                          "transcript pairs. A single file also pulls in its "
+                          "sibling tracks (01.transcript.json + 01.en.json).")
+    p_p.add_argument("--single", action="store_true",
+                     help="Play only the given transcript, no sibling tracks.")
     p_p.add_argument("--wav", type=Path, default=None,
                      help="Optional .wav to play alongside (uses macOS afplay).")
     p_p.add_argument("--speed", type=float, default=1.0,
